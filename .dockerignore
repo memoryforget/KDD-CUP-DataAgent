@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tmp
+*.swp
+.git/
+.gitignore
+.docs/
+docs/
+artifacts/
+tmp/
+vendor/bin/

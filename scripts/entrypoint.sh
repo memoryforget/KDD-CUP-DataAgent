@@ -94,4 +94,5 @@ node "${CCR_SERVER_ENTRY}" >>"${EVAL_LOG_ROOT}/claude_code_router.log" 2>&1 &
 CCR_PID=$!
 wait_for_port "${CCR_HOST}" "${CCR_PORT}"
 
-exec python "${PROJECT_ROOT}/app/run_eval.py" | tee -a "${EVAL_LOG_ROOT}/runtime.log"
+cd "${PROJECT_ROOT}"
+exec python -m app.run_eval | tee -a "${EVAL_LOG_ROOT}/runtime.log"

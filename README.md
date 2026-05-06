@@ -1,40 +1,73 @@
 # KDD Cup 2026 Submission Build
 
-This directory is an isolated, submission-oriented version of the current local pipeline:
+This repository is a submission-oriented benchmark runner built around:
 
-`Claude Agent SDK -> claude-code-router -> MODEL_API_URL`
+`Claude Agent SDK -> claude-code-router -> OpenAI-compatible model API`
 
 It is designed for the competition runtime contract:
 - `/input` mounted read-only
 - `/output` mounted read-write
 - `/logs` mounted read-write
-- `MODEL_API_URL`, `MODEL_API_KEY`, `MODEL_NAME` injected at runtime
+- `MODEL_API_URL`, `MODEL_API_KEY`, and `MODEL_NAME` injected at runtime
 
 ## Layout
-- `app/run_eval.py`: benchmark runner with per-task execution, MCP `answer` tool, CSV normalization, and concurrent scheduling
+- `app/run_eval.py`: task runner, agent session orchestration, MCP tool registration, and answer writing
+- `app/data_query_tools.py`: task-local structured data loading and unified SQLite query workspace
 - `scripts/entrypoint.sh`: container startup flow
-- `scripts/write_ccr_config.py`: writes the claude-code-router config from runtime env vars
+- `scripts/write_ccr_config.py`: router config generation from runtime env vars
 - `scripts/smoke_test_container.sh`: local Docker smoke test helper
 - `vendor/claude-code-router/packages/server/dist`: vendored router server bundle used at runtime
 - `Dockerfile`: runtime image build recipe
 
-## Runtime flow
-Container startup is intentionally small:
-1. `entrypoint.sh` validates required env vars and paths.
-2. `write_ccr_config.py` generates router config under `CCR_HOME`.
-3. Node starts the vendored `claude-code-router` server.
-4. `app/run_eval.py` discovers tasks under `/input` and writes predictions under `/output/task_<id>/prediction.csv`.
+## Runtime Flow
+1. `entrypoint.sh` validates required environment variables and paths.
+2. `write_ccr_config.py` generates the local `claude-code-router` config under `CCR_HOME`.
+3. Node starts the vendored router server.
+4. `app/run_eval.py` discovers tasks under `/input`.
+5. Each task gets an isolated work directory, log file, and temporary SQLite workspace.
+6. Final answers are written to `/output/task_<id>/prediction.csv`.
 
-## Default behavior
+## Data Access Design
+For each task, structured files under `context/` are unified into a temporary SQLite workspace:
+- CSV files are imported as SQLite tables.
+- JSON files are imported as SQLite tables.
+- Existing SQLite or DB files are mirrored into the same workspace.
+
+This gives the agent one consistent SQL query surface instead of multiple file-specific parsing paths.
+
+## Exposed MCP Tools
+The agent currently sees only a small task-local tool set:
+- `list_context_files`
+- `describe_query_workspace`
+- `query_data`
+- `answer`
+
+Design intent:
+- reduce tool distraction
+- prefer structured reasoning through SQLite
+
+## Agent Constraints
+The system prompt and runtime settings currently enforce these rules:
+- only read files inside the current task directory
+- do not read other tasks or any `gold.csv`
+- read `context/knowledge.md` before semantic interpretation when present
+- use `describe_query_workspace` before querying tables
+- use `query_data` for filtering, joins, aggregation, sorting, and ranking when structured data is available
+- submit the final result only through the `answer` tool
+
+
+## Default Logging
 This project defaults to submission-safe logging:
 - one runtime log at `/logs/runtime.log`
 - one task log per task under `/logs/tasks/`
-- no raw task context dumps in normal mode
-- no long reasoning dumps in normal mode
+- no full reasoning dumps in normal mode
+- no raw context dumps in normal mode
 
-Use `EVAL_LOG_MODE=debug` only for local debugging.
+Useful toggles:
+- `EVAL_LOG_MODE=submission|debug`
+- `EVAL_VERBOSE_LOGS=0|1`
 
-## Important runtime env vars
+## Required Runtime Environment Variables
 Required:
 - `MODEL_API_URL`
 - `MODEL_API_KEY`
@@ -46,23 +79,21 @@ Useful overrides:
 - `EVAL_TASK_IDS`: comma-separated subset such as `11,38,80` or `task_11,task_38`
 - `CLAUDE_EVAL_MAX_TURNS`: per-task max turns
 - `EVAL_LOG_MODE=submission|debug`
+- `EVAL_VERBOSE_LOGS=0|1`
 
-## Local build
+`MODEL_API_URL` may be given as an OpenAI-compatible `/v1` base URL. The router config step will normalize it to `/v1/chat/completions`.
+
+## Local Build
 ```bash
-docker build -t team1213:v1 .
+docker build -t team1213:v2 .
 ```
 
-For official submission packaging, use the assigned team id and submission version exactly.
-For your current team id, the first submission should be:
-- image name: `team1213:v1`
-- archive filename: `team1213_v1.tar.gz`
-
-Example export command:
+Example archive export:
 ```bash
-docker save team1213:v1 | gzip > team1213_v1.tar.gz
+docker save team1213:v2 | gzip > team1213_v2.tar.gz
 ```
 
-## Local smoke test
+## Local Smoke Test
 Make sure your model service is already running and reachable through `MODEL_API_URL`.
 
 ```bash
@@ -70,31 +101,29 @@ export MODEL_API_URL=http://127.0.0.1:8000/v1
 export MODEL_API_KEY=dummy
 export MODEL_NAME=qwen3.5-35b-a3b
 export EVAL_TASK_IDS=11
-bash scripts/smoke_test_container.sh team1213:v1
+bash scripts/smoke_test_container.sh team1213:v2
 ```
 
-## Competition packaging notes
-This setup is aligned with the official rules in the following ways:
-- it reads the model endpoint only from runtime env vars
-- it writes predictions only under `/output/task_<id>/prediction.csv`
-- it persists logs under `/logs`
-- it can process all tasks by traversing `/input`
-- it supports concurrent execution through `EVAL_MAX_WORKERS`
-- it sets a direct `ENTRYPOINT` suitable for `docker run` without extra parameters
-
-## Remaining pre-submission checks
-Before the final image is submitted, still verify these points on a machine with Docker:
-- the image builds cleanly
-- `claude-code-router` starts inside the container
-- the container can finish at least a representative regression set
-- log volume under `/logs` is acceptable
-- total image archive size stays below the competition limit
-
-## Official Run Contract
-After `docker load -i team1213_v1.tar.gz`, the evaluation system should be able to start the image directly with a command in the official shape:
-
+## Example Official-Style Run
 ```bash
-docker run --rm   --network=eval_net   --cpus=16   --memory=64g   --memory-swap=64g   -v /eval/data/input:/input:ro   -v /eval/<submission_id>/output:/output:rw   -v /eval/<submission_id>/logs:/logs:rw   -e MODEL_API_URL=<model_url>   -e MODEL_API_KEY=<api_key>   -e MODEL_NAME=qwen3.5-35b-a3b   team1213:v1
+docker run --rm \
+  --network=eval_net \
+  -v /eval/data/input:/input:ro \
+  -v /eval/submission/output:/output:rw \
+  -v /eval/submission/logs:/logs:rw \
+  -e MODEL_API_URL=<model_url> \
+  -e MODEL_API_KEY=<api_key> \
+  -e MODEL_NAME=qwen3.5-35b-a3b \
+  -e EVAL_MAX_WORKERS=1 \
+  team1213:v2
 ```
 
 No extra startup arguments are required because the image already sets `ENTRYPOINT`.
+
+## Pre-Submission Checks
+Before final submission, verify:
+- the image builds cleanly
+- `claude-code-router` starts inside the container
+- the container can finish a representative regression subset
+- logs under `/logs` remain manageable
+- the final image archive size stays within the competition limit

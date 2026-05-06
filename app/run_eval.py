@@ -5,10 +5,12 @@ import asyncio
 import csv
 import json
 import os
+import re
 import traceback
 from pathlib import Path
 from typing import Any
 
+from app.data_query_tools import ContextQueryWorkspace
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -29,7 +31,7 @@ MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "EMPTY")
 MAX_TASKS = int(os.environ.get("EVAL_MAX_TASKS", "0"))
 TASK_IDS_FILTER = [item.strip() for item in os.environ.get("EVAL_TASK_IDS", "").split(",") if item.strip()]
 MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "40"))
-MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "4")))
+MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "8")))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 DEBUG_TO_STDERR = os.environ.get("CLAUDE_DEBUG_TO_STDERR", "0") == "1"
@@ -38,11 +40,27 @@ SETTING_SOURCES = [
 ]
 LOG_MODE = os.environ.get("EVAL_LOG_MODE", "submission").strip().lower()
 VERBOSE_LOGS = os.environ.get("EVAL_VERBOSE_LOGS", "0") == "1"
+SYSTEM_PROMPT_APPEND = "\n".join([
+    "You are solving one benchmark task at a time.",
+    "Only read files inside the current task directory. Do not read files from other tasks, shared benchmark outputs, or any gold.csv file.",
+    "If context/knowledge.md exists, read it before deciding any business meaning such as severe, mild, stage, level, abnormal, positive, or status.",
+    "Do not guess the meaning of integer codes from numeric order. Use documented mappings from the current task evidence when available.",
+    "Use describe_query_workspace first.",
+    "If the workspace already contains the key data needed for the question, use query_data for filtering, joins, aggregation, sorting, and ranking.",
+    "If the workspace is missing a key table but the current task has relevant context/doc/*.md files, treat those docs as the primary source instead of continuing to search for more tables.",
+    "For repeated template-style documents, use Grep and Read to extract structured facts such as identifiers, measurements, categories, or affiliations.",
+    "Once current-task docs reveal the fields needed to solve the question, stop searching for more tables or files and finish from current-task evidence only.",
+    "Return only the columns explicitly requested by the question.",
+    "Submit the final result with the answer tool only. Do not write prediction.csv with Write, Edit, or Bash.",
+    'Pass answer.columns as a JSON array of strings and answer.rows as a JSON array of row arrays.',
+    "If a required field is still missing after choosing the correct source data, exclude that row unless the question explicitly allows missing values.",
+])
 TASK_LOG_DIR = LOG_ROOT / "tasks"
 NULL_TOKENS = {"", "null", "none", "nan", "nat", "<na>"}
 
 
 def normalize_task_id(task_id: str) -> str:
+    """Normalize task identifiers so filters accept both numeric ids and task_<id> values."""
     task_id = task_id.strip()
     if not task_id:
         return task_id
@@ -54,6 +72,7 @@ def normalize_task_id(task_id: str) -> str:
 
 
 def emit(task_log_path: Path, message: str) -> None:
+    """Write a log line to stdout and append the same line to the task log file."""
     print(message)
     task_log_path.parent.mkdir(parents=True, exist_ok=True)
     with task_log_path.open("a", encoding="utf-8") as handle:
@@ -63,6 +82,7 @@ def emit(task_log_path: Path, message: str) -> None:
 
 
 def make_task_logger(task_log_path: Path):
+    """Create a small task-scoped logger closure bound to one log file."""
     def _log(message: str) -> None:
         emit(task_log_path, message)
 
@@ -70,11 +90,13 @@ def make_task_logger(task_log_path: Path):
 
 
 def log_verbose(task_log, message: str) -> None:
+    """Emit a log message only when verbose evaluation logging is enabled."""
     if VERBOSE_LOGS:
         task_log(message)
 
 
 def log_claude_stderr_factory(task_log_path: Path):
+    """Create a stderr sink for Claude Code subprocess output."""
     def _log(line: str) -> None:
         if LOG_MODE == "debug":
             emit(task_log_path, f"[claude stderr] {line}")
@@ -83,6 +105,7 @@ def log_claude_stderr_factory(task_log_path: Path):
 
 
 def write_prediction_csv(output_csv: Path, columns: list[str], rows: list[list[str]]) -> None:
+    """Write the final prediction table to the required benchmark CSV path."""
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
@@ -91,6 +114,7 @@ def write_prediction_csv(output_csv: Path, columns: list[str], rows: list[list[s
 
 
 def normalize_cell(value: object) -> str:
+    """Normalize one output cell to the benchmark CSV text representation."""
     if value is None:
         return ""
 
@@ -100,7 +124,43 @@ def normalize_cell(value: object) -> str:
     return text
 
 
+def normalize_query_limit(raw_limit: Any, *, default: int = 200, minimum: int = 1, maximum: int = 1000) -> int:
+    """Validate and clamp the query_data limit argument from agent tool input."""
+    if raw_limit is None or raw_limit == "":
+        return default
+    if isinstance(raw_limit, bool):
+        raise ValueError("query_data.limit must be an integer, not a boolean.")
+    if isinstance(raw_limit, int):
+        parsed = raw_limit
+    elif isinstance(raw_limit, float):
+        if not raw_limit.is_integer():
+            raise ValueError(f"query_data.limit must be an integer, got non-integer float {raw_limit!r}.")
+        parsed = int(raw_limit)
+    elif isinstance(raw_limit, str):
+        text = raw_limit.strip()
+        if not text:
+            return default
+        if not re.fullmatch(r"[+-]?\d+", text):
+            raise ValueError(
+                f"query_data.limit must be an integer or numeric string, got {raw_limit!r}. "
+                'Retry with {"limit": 100, "sql": "..."} or omit limit.'
+            )
+        parsed = int(text)
+    else:
+        raise ValueError(
+            f"query_data.limit must be an integer or numeric string, got {type(raw_limit).__name__}. "
+            'Retry with {"limit": 100, "sql": "..."} or omit limit.'
+        )
+
+    if parsed < minimum:
+        return minimum
+    if parsed > maximum:
+        return maximum
+    return parsed
+
+
 def validate_answer_submission(columns: list[str], rows: list[list[Any]]) -> tuple[list[str], list[list[str]]]:
+    """Validate answer tool payloads and normalize them into CSV-ready strings."""
     normalized_columns: list[str] = []
     seen_columns: set[str] = set()
     for column in columns:
@@ -122,8 +182,72 @@ def validate_answer_submission(columns: list[str], rows: list[list[Any]]) -> tup
     return normalized_columns, normalized_rows
 
 
-def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path):
+def build_task_mcp_server(task_id: str, output_csv: Path, task_log_path: Path, query_workspace: ContextQueryWorkspace):
+    """Construct the task-local MCP server exposed to one agent session."""
     task_log = make_task_logger(task_log_path)
+
+    @tool(
+        name="list_context_files",
+        description="List files and directories available under the current task context.",
+        input_schema={
+            "max_depth": int,
+        },
+    )
+    async def list_context_files(args: dict[str, Any]) -> dict[str, Any]:
+        max_depth = max(1, int(args.get("max_depth", 4)))
+        result = query_workspace.list_context_files(max_depth=max_depth)
+        log_verbose(task_log, f"[{task_id}][list_context_files] entries={len(result['entries'])} max_depth={max_depth}")
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+
+    @tool(
+        name="describe_query_workspace",
+        description=(
+            "Describe the unified query workspace for this task. "
+            "CSV and JSON files are preloaded into a temporary SQLite workspace, and sqlite/db files are mirrored into it."
+        ),
+        input_schema={
+            "max_tables": int,
+            "sample_rows": int,
+        },
+    )
+    async def describe_query_workspace(args: dict[str, Any]) -> dict[str, Any]:
+        max_tables = max(1, int(args.get("max_tables", 200)))
+        sample_rows = max(1, int(args.get("sample_rows", 3)))
+        result = query_workspace.describe_query_workspace(max_tables=max_tables, sample_rows=sample_rows)
+        log_verbose(task_log, f"[{task_id}][describe_query_workspace] tables={result['table_count']}")
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+
+    @tool(
+        name="query_data",
+        description=(
+            "Run a read-only SQL query against the task's unified temporary SQLite workspace. "
+            "Use describe_query_workspace first to discover available table names. "
+            "Only SELECT, WITH, and PRAGMA statements are allowed. "
+            "limit is optional and accepts either an integer or a numeric string."
+        ),
+        input_schema={
+            "sql": str,
+            "limit": Any,
+        },
+    )
+    async def query_data(args: dict[str, Any]) -> dict[str, Any]:
+        sql = str(args.get("sql", "")).strip()
+        if not sql:
+            return {
+                "content": [{"type": "text", "text": "query_data.sql is required."}],
+                "is_error": True,
+            }
+        try:
+            limit = normalize_query_limit(args.get("limit", 200))
+            result = query_workspace.execute_query(sql, limit=limit)
+        except Exception as exc:
+            return {
+                "content": [{"type": "text", "text": str(exc)}],
+                "is_error": True,
+            }
+        log_verbose(task_log, f"[{task_id}][query_data] limit={limit} sql={sql[:4000]}")
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
+
 
     @tool(
         name="answer",
@@ -200,10 +324,14 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path)
             ]
         }
 
-    return create_sdk_mcp_server(name=f"{task_id}_answer_server", tools=[submit_answer])
+    return create_sdk_mcp_server(
+        name=f"{task_id}_task_server",
+        tools=[list_context_files, describe_query_workspace, query_data, submit_answer],
+    )
 
 
 def build_task_prompt(task_id: str, question: str) -> str:
+    """Build the compact task-specific prompt passed to Claude Code."""
     input_task_dir = INPUT_ROOT / task_id
     output_task_dir = OUTPUT_ROOT / task_id
     return "\n".join(
@@ -214,40 +342,19 @@ def build_task_prompt(task_id: str, question: str) -> str:
             f"- task.json: {input_task_dir / 'task.json'}",
             f"- context dir: {input_task_dir / 'context'}",
             f"- output csv: {output_task_dir / 'prediction.csv'}",
-            "Hard rules:",
-            "- Read only this task's files unless the question explicitly requires something else.",
-            "- Never write to the input directory.",
-            "- Do not diagnose paths, env vars, symlinks, or network access.",
-            "- Do not write prediction.csv with Write, Edit, or Bash.",
-            "- Use the MCP tool named answer to submit the final result.",
-            "- The answer tool is the only supported submission path.",
             "Execution:",
-            f"1. Read {input_task_dir / 'task.json'}.",
-            f"2. Inspect only the smallest relevant subset of files under {input_task_dir / 'context'}.",
-            "3. Solve directly with local tools.",
-            "4. As soon as you have one well-supported final answer, call answer exactly once and stop.",
-            "Answer tool format:",
-            '- Call answer with a JSON object, not a stringified JSON blob.',
-            '- columns must be a JSON array of strings, for example: ["ID", "SEX", "Diagnosis"].',
-            '- rows must be a JSON array of row arrays, for example: [["163109", "F", "SLE"], ["2803470", "F", "SLE"]].',
-            '- If there is one row, rows must still be nested, for example: [["17"]].',
-            '- Do not pass columns or rows as quoted strings.',
-            '- Do not flatten rows into a single list.',
-            '- Every row must have exactly the same number of cells as columns.',
-            "Answer selection rules:",
-            "- Return only the columns explicitly required by the question.",
-            "- If the question asks for a scalar metric, return only that metric.",
-            "- If a row is missing a required field, exclude that row unless the question explicitly allows missing values.",
-            "- Prefer the narrowest correct final table.",
-            "- Avoid repeated verification loops once the answer is already supported.",
-            "Final response:",
-            "- After a successful answer tool call, briefly summarize the submitted answer.",
+            "1. Read task.json.",
+            "2. Read context/knowledge.md when it exists.",
+            "3. Inspect the available task-local data sources.",
+            "4. Produce one well-supported final result.",
+            "5. Call answer exactly once, then stop.",
         ]
     )
 
 
 
 async def run_task(task_id: str) -> None:
+    """Run one benchmark task end-to-end and require a prediction.csv artifact on success."""
     task_dir = INPUT_ROOT / task_id
     task_json = json.loads((task_dir / "task.json").read_text(encoding="utf-8"))
     question = task_json["question"]
@@ -265,15 +372,23 @@ async def run_task(task_id: str) -> None:
     if DEBUG_TO_STDERR:
         extra_args["debug-to-stderr"] = None
 
-    answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path)
+    query_workspace = ContextQueryWorkspace(context_dir=task_dir / "context", work_dir=task_work_dir / "query_workspace")
+    task_server = build_task_mcp_server(
+        task_id=task_id,
+        output_csv=output_csv,
+        task_log_path=task_log_path,
+        query_workspace=query_workspace,
+    )
     options = ClaudeAgentOptions(
         tools={"type": "preset", "preset": "claude_code"},
-        mcp_servers={"answer_server": answer_server},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_PROMPT_APPEND},
+        mcp_servers={"task_server": task_server},
+        disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit"],
         permission_mode=PERMISSION_MODE,
         model=MODEL_NAME,
         max_turns=MAX_TURNS,
         cwd=task_work_dir,
-        add_dirs=[str(INPUT_ROOT), str(OUTPUT_ROOT), str(LOG_ROOT)],
+        add_dirs=[str(task_dir), str(output_csv.parent), str(task_log_path.parent)],
         cli_path=CLAUDE_CLI_PATH,
         setting_sources=SETTING_SOURCES,
         extra_args=extra_args,
@@ -395,6 +510,7 @@ async def run_task(task_id: str) -> None:
 
 
 async def amain() -> int:
+    """Discover tasks, apply runtime filters, and execute evaluation with bounded concurrency."""
     if not INPUT_ROOT.exists():
         raise RuntimeError(f"input root not found: {INPUT_ROOT}")
 

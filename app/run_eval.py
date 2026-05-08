@@ -41,6 +41,37 @@ VERBOSE_LOGS = os.environ.get("EVAL_VERBOSE_LOGS", "0") == "1"
 TASK_LOG_DIR = LOG_ROOT / "tasks"
 NULL_TOKENS = {"", "null", "none", "nan", "nat", "<na>"}
 
+SYSTEM_PROMPT_APPEND = "\n".join([
+    "You are a data-analysis agent solving benchmark tasks one at a time.",
+    "",
+    "## General rules",
+    "- Only access files belonging to the current task. Never read other tasks or any gold.csv.",
+    "- Never write to the input directory.",
+    "- Do not spend turns diagnosing paths, environment variables, symlinks, or network connectivity.",
+    "- If context/knowledge.md exists for the current task, read it first — it defines domain-specific terms, code mappings, and categorical meanings that override general knowledge.",
+    "",
+    "## Data analysis strategy",
+    "- Start by reading task.json to understand the question.",
+    "- List the context directory to see what files are available.",
+    "- For structured data (CSV, JSON, SQLite/DB), prefer writing and running short Python scripts via Bash to load, query, and analyze the data. Pandas and sqlite3 are available.",
+    "- For unstructured data (Markdown, text, PDFs), use Read and Grep to extract relevant information.",
+    "- Do not guess the meaning of categorical codes or integer labels from their numeric order. Rely on documentation or data evidence within the current task.",
+    "",
+    "## Answer submission",
+    "- Submit the final result exclusively through the MCP tool named `answer`. Do not write prediction.csv directly with Write, Edit, or Bash.",
+    "- Call `answer` exactly once with a JSON object (not a stringified JSON blob).",
+    "  - `columns`: a JSON array of strings, e.g. [\"ID\", \"SEX\", \"Diagnosis\"].",
+    "  - `rows`: a JSON array of row arrays, e.g. [[\"163109\", \"F\", \"SLE\"], [\"2803470\", \"F\", \"SLE\"]].",
+    "  - For a single-row answer, rows must still be nested: [[\"17\"]].",
+    "  - Do not pass columns or rows as quoted strings.",
+    "  - Every row must have exactly the same number of cells as columns.",
+    "- Return only the columns explicitly required by the question. Prefer the narrowest correct table.",
+    "- If the question asks for a single scalar metric, return exactly that metric.",
+    "- Exclude rows with missing required fields unless the question explicitly allows missing values.",
+    "- Once the answer is well-supported, submit it immediately. Avoid unnecessary verification loops.",
+    "- After a successful answer call, briefly summarize what was submitted, then stop.",
+])
+
 
 def normalize_task_id(task_id: str) -> str:
     task_id = task_id.strip()
@@ -205,45 +236,21 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path)
 
 def build_task_prompt(task_id: str, question: str) -> str:
     input_task_dir = INPUT_ROOT / task_id
-    output_task_dir = OUTPUT_ROOT / task_id
-    return "\n".join(
-        [
-            f"You are solving benchmark task {task_id}.",
-            f"Question: {question}",
-            "Paths:",
-            f"- task.json: {input_task_dir / 'task.json'}",
-            f"- context dir: {input_task_dir / 'context'}",
-            f"- output csv: {output_task_dir / 'prediction.csv'}",
-            "Hard rules:",
-            "- Read only this task's files unless the question explicitly requires something else.",
-            "- Never write to the input directory.",
-            "- Do not diagnose paths, env vars, symlinks, or network access.",
-            "- Do not write prediction.csv with Write, Edit, or Bash.",
-            "- Use the MCP tool named answer to submit the final result.",
-            "- The answer tool is the only supported submission path.",
-            "Execution:",
-            f"1. Read {input_task_dir / 'task.json'}.",
-            f"2. Inspect only the smallest relevant subset of files under {input_task_dir / 'context'}.",
-            "3. Solve directly with local tools.",
-            "4. As soon as you have one well-supported final answer, call answer exactly once and stop.",
-            "Answer tool format:",
-            '- Call answer with a JSON object, not a stringified JSON blob.',
-            '- columns must be a JSON array of strings, for example: ["ID", "SEX", "Diagnosis"].',
-            '- rows must be a JSON array of row arrays, for example: [["163109", "F", "SLE"], ["2803470", "F", "SLE"]].',
-            '- If there is one row, rows must still be nested, for example: [["17"]].',
-            '- Do not pass columns or rows as quoted strings.',
-            '- Do not flatten rows into a single list.',
-            '- Every row must have exactly the same number of cells as columns.',
-            "Answer selection rules:",
-            "- Return only the columns explicitly required by the question.",
-            "- If the question asks for a scalar metric, return only that metric.",
-            "- If a row is missing a required field, exclude that row unless the question explicitly allows missing values.",
-            "- Prefer the narrowest correct final table.",
-            "- Avoid repeated verification loops once the answer is already supported.",
-            "Final response:",
-            "- After a successful answer tool call, briefly summarize the submitted answer.",
-        ]
-    )
+    return "\n".join([
+        f"## Task {task_id}",
+        "",
+        f"**Question:** {question}",
+        "",
+        f"**Task directory:** {input_task_dir}",
+        f"  - task.json: {input_task_dir / 'task.json'}",
+        f"  - context/: {input_task_dir / 'context'}",
+        "",
+        "**Steps:**",
+        f"1. Read {input_task_dir / 'task.json'} for the full task specification.",
+        f"2. List {input_task_dir / 'context'} and examine the relevant data files.",
+        "3. Analyze the data and derive the answer.",
+        "4. Call the `answer` tool exactly once with the result.",
+    ])
 
 
 
@@ -268,6 +275,7 @@ async def run_task(task_id: str) -> None:
     answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path)
     options = ClaudeAgentOptions(
         tools={"type": "preset", "preset": "claude_code"},
+        system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_PROMPT_APPEND},
         mcp_servers={"answer_server": answer_server},
         permission_mode=PERMISSION_MODE,
         model=MODEL_NAME,

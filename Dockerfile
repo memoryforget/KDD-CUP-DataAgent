@@ -25,6 +25,15 @@ WORKDIR /opt/kddcup-submission
 
 COPY requirements.txt ./requirements.txt
 RUN pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn --default-timeout=1000
+
+COPY models/all-MiniLM-L6-v2 /opt/models/all-MiniLM-L6-v2
+ENV EVAL_RAG_EMBEDDING_MODEL=/opt/models/all-MiniLM-L6-v2 \
+    EVAL_RAG_ENABLE_VECTOR=1 \
+    EVAL_RAG_VECTOR_WEIGHT=0.30 \
+    HF_HOME=/opt/models/.cache \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1
+
 RUN npm install -g @anthropic-ai/claude-code@2.1.112
 
 COPY app ./app

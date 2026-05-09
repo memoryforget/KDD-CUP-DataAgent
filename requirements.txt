@@ -1,3 +1,5 @@
 claude-agent-sdk
 python-dateutil
 requests
+numpy
+sentence-transformers

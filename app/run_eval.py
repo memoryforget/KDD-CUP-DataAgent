@@ -5,9 +5,16 @@ import asyncio
 import csv
 import json
 import os
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.markdown_rag import MAX_SNIPPET_CHARS, MarkdownRagIndex, clamp_int
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -54,18 +61,19 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- Start by reading task.json to understand the question.",
     "- List the context directory to see what files are available.",
     "- For structured data (CSV, JSON, SQLite/DB), prefer writing and running short Python scripts via Bash to load, query, and analyze the data. Pandas and sqlite3 are available.",
-    "- For unstructured data (Markdown, text, PDFs), use Read and Grep to extract relevant information.",
+    "- For unstructured data, especially Markdown/text files, use the MCP tools `list_markdown_docs`, `search_markdown`, and `read_markdown_chunk` before any broad Read/Grep/Bash parsing.",
+    "- If a Markdown/text file is longer than about 200 lines, do not read or parse the whole file first. Search it with `search_markdown`, then read only relevant chunks with `read_markdown_chunk`.",
+    "- For questions over long narrative Markdown datasets, run multiple focused `search_markdown` queries for the requested fields/entities before writing Python parsers.",
     "- Do not guess the meaning of categorical codes or integer labels from their numeric order. Rely on documentation or data evidence within the current task.",
     "",
     "## Answer submission",
     "- Submit the final result exclusively through the MCP tool named `answer`. Do not write prediction.csv directly with Write, Edit, or Bash.",
-    "- Call `answer` exactly once with a JSON object (not a stringified JSON blob).",
-    "  - `columns`: a JSON array of strings, e.g. [\"ID\", \"SEX\", \"Diagnosis\"].",
-    "  - `rows`: a JSON array of row arrays, e.g. [[\"163109\", \"F\", \"SLE\"], [\"2803470\", \"F\", \"SLE\"]].",
-    "  - For a single-row answer, rows must still be nested: [[\"17\"]].",
-    "  - Do not pass columns or rows as quoted strings.",
+    "- Call `answer` exactly once with a JSON object containing `columns` and `rows`.",
+    "  - Prefer native arrays, not quoted JSON strings; quoted JSON strings are accepted only as a fallback.",
     "  - Every row must have exactly the same number of cells as columns.",
     "- Return only the columns explicitly required by the question. Prefer the narrowest correct table.",
+    "- The grader penalizes redundant columns: extra columns may reduce score, and many irrelevant columns can significantly reduce score.",
+    "- Before calling answer, remove helper, evidence, intermediate, explanation, source, confidence, debug, or calculation columns unless the question explicitly asks for them.",
     "- If the question asks for a single scalar metric, return exactly that metric.",
     "- Exclude rows with missing required fields unless the question explicitly allows missing values.",
     "- Once the answer is well-supported, submit it immediately. Avoid unnecessary verification loops.",
@@ -153,19 +161,107 @@ def validate_answer_submission(columns: list[str], rows: list[list[Any]]) -> tup
     return normalized_columns, normalized_rows
 
 
-def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path):
+def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path, task_dir: Path):
     task_log = make_task_logger(task_log_path)
+    markdown_index = MarkdownRagIndex(task_dir)
+
+    @tool(
+        name="list_markdown_docs",
+        description=(
+            "List task-local Markdown/text documents indexed for focused retrieval. "
+            "Use this before reading long Markdown files directly."
+        ),
+        input_schema={
+            "max_docs": Any,
+        },
+    )
+    async def list_markdown_docs(args: dict[str, Any]) -> dict[str, Any]:
+        max_docs = clamp_int(args.get("max_docs"), default=200, minimum=1, maximum=500)
+        result = markdown_index.list_docs(max_docs=max_docs)
+        rendered = json.dumps(result, ensure_ascii=False)
+        log_verbose(task_log, f"[{task_id}][list_markdown_docs] docs={result['doc_count']}")
+        if LOG_MODE == "debug":
+            task_log(f"[{task_id}][list_markdown_docs][debug_result] {rendered[:12000]}")
+        return {"content": [{"type": "text", "text": rendered}]}
+
+    @tool(
+        name="search_markdown",
+        description=(
+            "Search task-local Markdown/text documents and return ranked snippets with file paths, chunk ids, and line ranges. "
+            "Use this for long documents instead of broad Read/Grep. Search for entity ids, field names, abbreviations, and domain terms."
+        ),
+        input_schema={
+            "query": str,
+            "limit": Any,
+            "max_chars": Any,
+        },
+    )
+    async def search_markdown(args: dict[str, Any]) -> dict[str, Any]:
+        query_text = str(args.get("query", "")).strip()
+        limit = clamp_int(args.get("limit"), default=8, minimum=1, maximum=25)
+        max_chars = clamp_int(args.get("max_chars"), default=MAX_SNIPPET_CHARS, minimum=300, maximum=5000)
+        result = markdown_index.search(query_text=query_text, limit=limit, max_chars=max_chars)
+        rendered = json.dumps(result, ensure_ascii=False)
+        log_verbose(task_log, f"[{task_id}][search_markdown] query={query_text[:200]!r} matches={result.get('match_count')}")
+        if LOG_MODE == "debug":
+            task_log(f"[{task_id}][search_markdown][debug_result] {rendered[:20000]}")
+        return {"content": [{"type": "text", "text": rendered}]}
+
+    @tool(
+        name="read_markdown_chunk",
+        description=(
+            "Read one focused chunk or line range from a task-local Markdown/text document. "
+            "Pass path plus either chunk_id from search_markdown or line_start/line_end."
+        ),
+        input_schema={
+            "path": str,
+            "chunk_id": Any,
+            "line_start": Any,
+            "line_end": Any,
+            "context_lines": Any,
+        },
+    )
+    async def read_markdown_chunk(args: dict[str, Any]) -> dict[str, Any]:
+        rel_path = str(args.get("path", "")).strip()
+        chunk_id = args.get("chunk_id")
+        line_start = args.get("line_start")
+        line_end = args.get("line_end")
+        context_lines = clamp_int(args.get("context_lines"), default=0, minimum=0, maximum=40)
+        parsed_chunk_id = None if chunk_id in (None, "") else clamp_int(chunk_id, default=-1, minimum=-1, maximum=1_000_000)
+        parsed_line_start = None if line_start in (None, "") else clamp_int(line_start, default=1, minimum=1, maximum=10_000_000)
+        parsed_line_end = None if line_end in (None, "") else clamp_int(line_end, default=1, minimum=1, maximum=10_000_000)
+        result = markdown_index.read_chunk(
+            rel_path=rel_path,
+            chunk_id=parsed_chunk_id,
+            line_start=parsed_line_start,
+            line_end=parsed_line_end,
+            context_lines=context_lines,
+        )
+        rendered = json.dumps(result, ensure_ascii=False)
+        log_verbose(
+            task_log,
+            f"[{task_id}][read_markdown_chunk] path={rel_path} chunk_id={parsed_chunk_id} "
+            f"lines={parsed_line_start}-{parsed_line_end}",
+        )
+        if LOG_MODE == "debug":
+            task_log(f"[{task_id}][read_markdown_chunk][debug_result] {rendered[:20000]}")
+        return {"content": [{"type": "text", "text": rendered}], "is_error": bool(result.get("is_error"))}
 
     @tool(
         name="answer",
         description=(
             "Submit the final benchmark answer as a compact table. "
             "Use only the minimum required columns and rows for the question. "
-            "Do not include explanatory or intermediate columns unless the question explicitly asks for them."
+            "Do not include explanatory or intermediate columns unless the question explicitly asks for them. "
+            "Input must be an object with columns and rows. "
+            "columns should be a JSON array of strings, for example [\"id\", \"amount\"]. "
+            "rows should be a JSON array of row arrays, for example [[\"1\", \"100\"], [\"2\", \"200\"]]. "
+            "Every row must have the same number of cells as columns. "
+            "Prefer passing native arrays, not quoted JSON strings; quoted JSON strings are accepted only as a fallback."
         ),
         input_schema={
-            "columns": list[str],
-            "rows": list[list[Any]],
+            "columns": Any,
+            "rows": Any,
         },
     )
     async def submit_answer(args: dict[str, Any]) -> dict[str, Any]:
@@ -176,14 +272,20 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path)
         if isinstance(columns, str):
             try:
                 columns = json.loads(columns)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                return {
+                    "content": [{"type": "text", "text": f"answer.columns is a string but not valid JSON: {exc}"}],
+                    "is_error": True,
+                }
 
         if isinstance(rows, str):
             try:
                 rows = json.loads(rows)
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as exc:
+                return {
+                    "content": [{"type": "text", "text": f"answer.rows is a string but not valid JSON: {exc}"}],
+                    "is_error": True,
+                }
 
         if not isinstance(columns, list) or not columns or not all(isinstance(item, str) for item in columns):
             return {
@@ -231,11 +333,15 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path)
             ]
         }
 
-    return create_sdk_mcp_server(name=f"{task_id}_answer_server", tools=[submit_answer])
+    return create_sdk_mcp_server(
+        name=f"{task_id}_answer_server",
+        tools=[list_markdown_docs, search_markdown, read_markdown_chunk, submit_answer],
+    )
 
 
 def build_task_prompt(task_id: str, question: str) -> str:
     input_task_dir = INPUT_ROOT / task_id
+    work_task_dir = WORK_ROOT / task_id
     return "\n".join([
         f"## Task {task_id}",
         "",
@@ -244,12 +350,16 @@ def build_task_prompt(task_id: str, question: str) -> str:
         f"**Task directory:** {input_task_dir}",
         f"  - task.json: {input_task_dir / 'task.json'}",
         f"  - context/: {input_task_dir / 'context'}",
+        f"**Working directory:** {work_task_dir}",
+        "  - Use this directory for temporary scripts, scratch files, and intermediate outputs.",
+        "  - Do not write to the task input directory.",
         "",
         "**Steps:**",
         f"1. Read {input_task_dir / 'task.json'} for the full task specification.",
         f"2. List {input_task_dir / 'context'} and examine the relevant data files.",
-        "3. Analyze the data and derive the answer.",
-        "4. Call the `answer` tool exactly once with the result.",
+        "3. If Markdown/text documents are present, call `list_markdown_docs` first. For any long Markdown/text document, use `search_markdown` and `read_markdown_chunk` before direct Read/Grep/Bash parsing.",
+        "4. Analyze the data and derive the answer. Use focused RAG snippets as anchors for long narrative documents.",
+        "5. Call the `answer` tool exactly once with the result.",
     ])
 
 
@@ -272,7 +382,7 @@ async def run_task(task_id: str) -> None:
     if DEBUG_TO_STDERR:
         extra_args["debug-to-stderr"] = None
 
-    answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path)
+    answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path, task_dir=task_dir)
     options = ClaudeAgentOptions(
         tools={"type": "preset", "preset": "claude_code"},
         system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_PROMPT_APPEND},
@@ -301,89 +411,118 @@ async def run_task(task_id: str) -> None:
     )
 
     final_texts: list[str] = []
-    result_subtype: str | None = None
-    failed = False
 
-    try:
-        async for message in query(prompt=build_task_prompt(task_id, question), options=options):
-            if isinstance(message, AssistantMessage):
-                rendered_blocks = 0
-                text_parts: list[str] = []
-                for block in message.content:
-                    block_text = getattr(block, "text", None)
-                    if block_text:
-                        rendered_blocks += 1
-                        text_parts.append(block_text)
-                        log_verbose(task_log, f"\n[{task_id}][assistant][text]\n{block_text}")
-                        continue
+    async def run_agent_turn(turn_prompt: str, turn_options: ClaudeAgentOptions, label: str) -> tuple[bool, str | None, str | None, bool]:
+        result_subtype: str | None = None
+        session_id: str | None = None
+        turn_failed = False
+        turn_started = False
 
-                    thinking = getattr(block, "thinking", None)
-                    if thinking:
-                        rendered_blocks += 1
-                        log_verbose(task_log, f"\n[{task_id}][assistant][thinking]\n{thinking}")
-                        continue
+        try:
+            async for message in query(prompt=turn_prompt, options=turn_options):
+                if isinstance(message, AssistantMessage):
+                    rendered_blocks = 0
+                    text_parts: list[str] = []
+                    for block in message.content:
+                        block_text = getattr(block, "text", None)
+                        if block_text:
+                            rendered_blocks += 1
+                            text_parts.append(block_text)
+                            log_verbose(task_log, f"\n[{task_id}][{label}][assistant][text]\n{block_text}")
+                            continue
 
-                    tool_name = getattr(block, "name", None)
-                    tool_input = getattr(block, "input", None)
-                    if tool_name is not None and tool_input is not None:
-                        rendered_blocks += 1
-                        log_verbose(
-                            task_log,
-                            f"\n[{task_id}][assistant][tool_use] name={tool_name} input="
-                            f"{json.dumps(tool_input, ensure_ascii=False, sort_keys=True)[:4000]}"
-                        )
-                        continue
+                        thinking = getattr(block, "thinking", None)
+                        if thinking:
+                            rendered_blocks += 1
+                            log_verbose(task_log, f"\n[{task_id}][{label}][assistant][thinking]\n{thinking}")
+                            continue
 
-                    tool_use_id = getattr(block, "tool_use_id", None)
-                    if tool_use_id is not None:
-                        rendered_blocks += 1
-                        tool_result = getattr(block, "content", None)
-                        tool_is_error = getattr(block, "is_error", None)
-                        if isinstance(tool_result, list):
-                            rendered_result = json.dumps(tool_result, ensure_ascii=False, sort_keys=True)[:4000]
-                        else:
-                            rendered_result = str(tool_result)[:4000]
-                        log_verbose(
-                            task_log,
-                            f"\n[{task_id}][assistant][tool_result] tool_use_id={tool_use_id} "
-                            f"is_error={tool_is_error} content={rendered_result}"
-                        )
-                        continue
+                        tool_name = getattr(block, "name", None)
+                        tool_input = getattr(block, "input", None)
+                        if tool_name is not None and tool_input is not None:
+                            rendered_blocks += 1
+                            log_verbose(
+                                task_log,
+                                f"\n[{task_id}][{label}][assistant][tool_use] name={tool_name} input="
+                                f"{json.dumps(tool_input, ensure_ascii=False, sort_keys=True)[:4000]}"
+                            )
+                            continue
 
-                if text_parts:
-                    final_texts.append("\n".join(text_parts))
-                if rendered_blocks == 0:
-                    log_verbose(task_log, f"\n[{task_id}][assistant][empty_message]")
-            elif isinstance(message, SystemMessage):
-                subtype = getattr(message, "subtype", "")
-                data = getattr(message, "data", {})
-                task_log(f"\n[{task_id}][system] subtype={subtype}")
-                if VERBOSE_LOGS and data:
-                    task_log(json.dumps(data, ensure_ascii=False, default=str)[:4000])
-            elif isinstance(message, ResultMessage):
-                result_subtype = message.subtype
-                task_log(f"[{task_id}][result] {message.subtype}")
-                if VERBOSE_LOGS and getattr(message, "usage", None):
-                    task_log(f"[{task_id}][result][usage] {json.dumps(message.usage, ensure_ascii=False, default=str)[:2000]}")
-                if VERBOSE_LOGS and getattr(message, "result", None):
-                    task_log(f"[{task_id}][result][text] {str(message.result)[:4000]}")
-                if VERBOSE_LOGS and getattr(message, "errors", None):
-                    task_log(f"[{task_id}][result][errors] {json.dumps(message.errors, ensure_ascii=False, default=str)[:4000]}")
-    except Exception as exc:
-        failed = True
-        task_log(f"[{task_id}][turn failed] {exc}")
-        task_log(f"[{task_id}][turn failed repr] {exc!r}")
-        cause = getattr(exc, "__cause__", None)
-        if cause is not None:
-            task_log(f"[{task_id}][turn failed cause] {cause!r}")
-        context = getattr(exc, "__context__", None)
-        if context is not None:
-            task_log(f"[{task_id}][turn failed context] {context!r}")
-        for attr in ("stderr", "stdout", "message", "args"):
-            value = getattr(exc, attr, None)
-            if value:
-                task_log(f"[{task_id}][turn failed {attr}] {value}")
-        task_log(f"[{task_id}][turn failed traceback]\n{traceback.format_exc()}")
+                        tool_use_id = getattr(block, "tool_use_id", None)
+                        if tool_use_id is not None:
+                            rendered_blocks += 1
+                            tool_result = getattr(block, "content", None)
+                            tool_is_error = getattr(block, "is_error", None)
+                            if isinstance(tool_result, list):
+                                rendered_result = json.dumps(tool_result, ensure_ascii=False, sort_keys=True)[:4000]
+                            else:
+                                rendered_result = str(tool_result)[:4000]
+                            log_verbose(
+                                task_log,
+                                f"\n[{task_id}][{label}][assistant][tool_result] tool_use_id={tool_use_id} "
+                                f"is_error={tool_is_error} content={rendered_result}"
+                            )
+                            continue
+
+                    if text_parts:
+                        final_texts.append("\n".join(text_parts))
+                    if rendered_blocks == 0:
+                        log_verbose(task_log, f"\n[{task_id}][{label}][assistant][empty_message]")
+                elif isinstance(message, SystemMessage):
+                    turn_started = True
+                    subtype = getattr(message, "subtype", "")
+                    data = getattr(message, "data", {})
+                    if isinstance(data, dict) and data.get("session_id"):
+                        session_id = str(data["session_id"])
+                    task_log(f"\n[{task_id}][{label}][system] subtype={subtype}")
+                    if VERBOSE_LOGS and data:
+                        task_log(json.dumps(data, ensure_ascii=False, default=str)[:4000])
+                elif isinstance(message, ResultMessage):
+                    result_subtype = message.subtype
+                    if getattr(message, "session_id", None):
+                        session_id = message.session_id
+                    task_log(f"[{task_id}][{label}][result] {message.subtype}")
+                    if VERBOSE_LOGS and getattr(message, "usage", None):
+                        task_log(f"[{task_id}][{label}][result][usage] {json.dumps(message.usage, ensure_ascii=False, default=str)[:2000]}")
+                    if VERBOSE_LOGS and getattr(message, "result", None):
+                        task_log(f"[{task_id}][{label}][result][text] {str(message.result)[:4000]}")
+                    if VERBOSE_LOGS and getattr(message, "errors", None):
+                        task_log(f"[{task_id}][{label}][result][errors] {json.dumps(message.errors, ensure_ascii=False, default=str)[:4000]}")
+                    break
+        except asyncio.CancelledError as exc:
+            turn_failed = True
+            task_log(f"[{task_id}][{label}][turn cancelled] {exc}")
+            task_log(f"[{task_id}][{label}][turn cancelled repr] {exc!r}")
+            cause = getattr(exc, "__cause__", None)
+            if cause is not None:
+                task_log(f"[{task_id}][{label}][turn cancelled cause] {cause!r}")
+            context = getattr(exc, "__context__", None)
+            if context is not None:
+                task_log(f"[{task_id}][{label}][turn cancelled context] {context!r}")
+            task_log(f"[{task_id}][{label}][turn cancelled traceback]\n{traceback.format_exc()}")
+        except Exception as exc:
+            turn_failed = True
+            task_log(f"[{task_id}][{label}][turn failed] {exc}")
+            task_log(f"[{task_id}][{label}][turn failed repr] {exc!r}")
+            cause = getattr(exc, "__cause__", None)
+            if cause is not None:
+                task_log(f"[{task_id}][{label}][turn failed cause] {cause!r}")
+            context = getattr(exc, "__context__", None)
+            if context is not None:
+                task_log(f"[{task_id}][{label}][turn failed context] {context!r}")
+            for attr in ("stderr", "stdout", "message", "args"):
+                value = getattr(exc, attr, None)
+                if value:
+                    task_log(f"[{task_id}][{label}][turn failed {attr}] {value}")
+            task_log(f"[{task_id}][{label}][turn failed traceback]\n{traceback.format_exc()}")
+
+        return turn_failed, result_subtype, session_id, turn_started
+
+    failed, result_subtype, session_id, _initial_started = await run_agent_turn(
+        turn_prompt=build_task_prompt(task_id, question),
+        turn_options=options,
+        label="initial",
+    )
 
     has_output = output_csv.exists()
     if has_output:
@@ -449,10 +588,12 @@ async def amain() -> int:
         async with semaphore:
             try:
                 await run_task(task_id)
+            except asyncio.CancelledError as exc:
+                print(f"[task cancelled] {task_id}: {exc!r}")
             except Exception as exc:
                 print(f"[task failure] {task_id}: {exc}")
 
-    await asyncio.gather(*(run_task_with_limit(task_id) for task_id in task_ids))
+    await asyncio.gather(*(run_task_with_limit(task_id) for task_id in task_ids), return_exceptions=True)
     return 0
 
 

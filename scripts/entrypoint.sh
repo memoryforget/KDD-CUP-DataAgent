@@ -88,10 +88,44 @@ echo "[info] ccrListen=http://${CCR_HOST}:${CCR_PORT}"
 
 python "${PROJECT_ROOT}/scripts/write_ccr_config.py"
 
-SERVICE_PORT="${CCR_PORT}" \
-HOME="${HOME}" \
-node "${CCR_SERVER_ENTRY}" >>"${EVAL_LOG_ROOT}/claude_code_router.log" 2>&1 &
-CCR_PID=$!
+start_ccr() {
+  SERVICE_PORT="${CCR_PORT}" HOME="${HOME}" \
+    node --max-old-space-size=2048 "${CCR_SERVER_ENTRY}" >>"${EVAL_LOG_ROOT}/claude_code_router.log" 2>&1 &
+  CCR_PID=$!
+  echo "[ccr] started pid=${CCR_PID}" >>"${EVAL_LOG_ROOT}/runtime.log"
+}
+
+start_ccr
 wait_for_port "${CCR_HOST}" "${CCR_PORT}"
+
+# Watchdog: if CCR dies under load, restart it.
+(
+  while true; do
+    if [[ -n "${CCR_PID:-}" ]] && ! kill -0 "${CCR_PID}" >/dev/null 2>&1; then
+      echo "[ccr-watchdog] ccr pid=${CCR_PID} died, restarting" >>"${EVAL_LOG_ROOT}/runtime.log"
+      sleep 1
+      SERVICE_PORT="${CCR_PORT}" HOME="${HOME}" \
+        node --max-old-space-size=2048 "${CCR_SERVER_ENTRY}" >>"${EVAL_LOG_ROOT}/claude_code_router.log" 2>&1 &
+      CCR_PID=$!
+      echo "[ccr-watchdog] restarted pid=${CCR_PID}" >>"${EVAL_LOG_ROOT}/runtime.log"
+    fi
+    sleep 3
+  done
+) &
+WATCHDOG_PID=$!
+echo "[ccr-watchdog] started pid=${WATCHDOG_PID}" >>"${EVAL_LOG_ROOT}/runtime.log"
+
+# Update cleanup to also kill watchdog. (Re-trap.)
+cleanup() {
+  if [[ -n "${WATCHDOG_PID:-}" ]]; then
+    kill "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+    wait "${WATCHDOG_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${CCR_PID:-}" ]]; then
+    kill "${CCR_PID}" >/dev/null 2>&1 || true
+    wait "${CCR_PID}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT INT TERM
 
 exec python "${PROJECT_ROOT}/app/run_eval.py" | tee -a "${EVAL_LOG_ROOT}/runtime.log"

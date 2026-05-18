@@ -3,3 +3,6 @@ python-dateutil
 requests
 numpy
 sentence-transformers
+pandas
+pymupdf
+python-docx

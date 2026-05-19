@@ -177,8 +177,36 @@ def write_prediction_csv(output_csv: Path, columns: list[str], rows: list[list[s
 
 
 def normalize_cell(value: object) -> str:
+    """Normalize a cell value into the string form the grader will see.
+
+    Strategy:
+      * None and NaN → ""
+      * bool → "true" / "false"
+      * int → str(int)
+      * float → drop `.0` for integer-valued floats (60.0 → "60"); otherwise `repr(value)` to
+        keep full precision (e.g. 60.77956989247312, NOT str() rounding).
+      * everything else → str(value).strip(), with NULL tokens and \r normalized.
+
+    Agents often pass numeric types via JSON, so handling them explicitly here is more reliable
+    than relying on str() alone — `60.0` vs `60` is the most common silent mismatch.
+    """
     if value is None:
         return ""
+
+    if isinstance(value, bool):
+        # Defensive: bool is a subclass of int in Python, so this branch must come first.
+        return "true" if value else "false"
+
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return ""
+        if value.is_integer():
+            return str(int(value))
+        # repr is round-trip exact for floats in Python 3 and avoids str()'s short-form rounding.
+        return repr(value)
+
+    if isinstance(value, int):
+        return str(value)
 
     text = str(value).strip().replace("\r\n", "\n").replace("\r", "\n")
     if text.lower() in NULL_TOKENS:

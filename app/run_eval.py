@@ -812,6 +812,29 @@ def _summarize_schema_for_prompt(schema: dict[str, Any], char_budget: int = 1600
                 push(f"- {f.get('path')}  paragraphs={f.get('paragraph_count','?')}")
                 for p in (f.get("first_paragraphs") or [])[:3]:
                     push(f"    {p[:200]}")
+
+    # Append potential join keys at the end so the model sees them after all the
+    # column lists. These are structural hints (column-name + value-overlap) and
+    # do NOT depend on task semantics — a no-op if the data has no obvious joins.
+    joins = schema.get("potential_joins") or []
+    if joins:
+        push("")
+        push(f"### Potential join keys ({len(joins)}) — name-match across files/tables, ranked")
+        for j in joins[:30]:
+            ov = j.get("value_overlap_jaccard")
+            ov_text = f"  overlap={ov}" if ov is not None else ""
+            tags = []
+            if j.get("name_match"):
+                tags.append("same-name")
+            if j.get("id_like"):
+                tags.append("id-like")
+            if j.get("link_to"):
+                tags.append("link_to")
+            tag_text = f"  [{','.join(tags)}]" if tags else ""
+            pushed = push(f"  {j['left']} <-> {j['right']}{tag_text}{ov_text}")
+            if not pushed:
+                break
+
     return "".join(lines).rstrip()
 
 

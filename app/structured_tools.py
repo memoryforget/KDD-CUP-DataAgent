@@ -271,6 +271,11 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
 
     Markdown / text files are intentionally skipped because there is a separate
     MarkdownRagIndex tool for those.
+
+    The output additionally contains a `potential_joins` section: a list of
+    columns/fields that are good join-key candidates across files (same or
+    near-same name, value set overlap above threshold). This is a purely
+    structural signal — it does not consult task semantics.
     """
     context_dir = task_dir / "context"
     out: dict[str, Any] = {
@@ -282,6 +287,7 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
         "pdf": [],
         "docx": [],
         "skipped": [],
+        "potential_joins": [],
     }
     if not context_dir.exists():
         out["error"] = "context dir does not exist"
@@ -311,7 +317,151 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
                 out["skipped"].append({"path": str(path), "ext": suffix})
         except Exception as exc:  # pragma: no cover
             out["skipped"].append({"path": str(path), "ext": suffix, "error": repr(exc)})
+
+    # Detect potential join keys across the discovered tabular files.
+    try:
+        out["potential_joins"] = _detect_potential_joins(out)
+    except Exception as exc:  # pragma: no cover - defensive; never let join detect break inspect_data
+        out["potential_joins"] = []
+        out["skipped"].append({"phase": "potential_joins", "error": repr(exc)})
+
     return out
+
+
+def _is_id_like(name: str) -> bool:
+    n = name.lower()
+    return n.endswith("_id") or n == "id" or n.endswith("id") and len(n) > 2 and n[-3].isalpha()
+
+
+def _collect_columns(inspect_out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Gather every (file_path, column_name, sample_values, unique_count) tuple
+    from csv + json (records-shaped) + sqlite tables."""
+    cols: list[dict[str, Any]] = []
+    for f in inspect_out.get("csv", []):
+        if f.get("is_error"):
+            continue
+        for c in f.get("columns", []) or []:
+            cols.append({
+                "loc": f.get("path"),
+                "kind": "csv",
+                "name": c.get("name", ""),
+                "samples": list(c.get("samples", []) or []),
+                "values": list(c.get("values") or []),
+                "unique": c.get("unique_count_capped_1000"),
+            })
+    for f in inspect_out.get("json", []):
+        if f.get("is_error"):
+            continue
+        for c in f.get("columns", []) or []:
+            cols.append({
+                "loc": f.get("path"),
+                "kind": "json",
+                "name": c.get("name", ""),
+                "samples": list(c.get("samples", []) or []),
+                "values": list(c.get("values") or []),
+                "unique": c.get("unique_count_capped_1000"),
+            })
+    for f in inspect_out.get("sqlite", []):
+        if f.get("is_error"):
+            continue
+        for tbl in f.get("tables", []):
+            tname = tbl.get("name")
+            for c in tbl.get("columns", []):
+                cols.append({
+                    "loc": f"{f.get('path')}::{tname}",
+                    "kind": "sqlite",
+                    "name": c.get("name", ""),
+                    "samples": [],
+                    "values": [],
+                    "unique": None,
+                })
+    return cols
+
+
+def _detect_potential_joins(inspect_out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return a list of likely join-key candidate pairs.
+
+    Two columns are flagged as a candidate when ANY of these hold:
+      * names match exactly (case-insensitive)
+      * one name is the other's `_id`/`id` form
+      * names match after stripping a common `_id` suffix
+      * `link_to_X` on one side matches `X_id` / `X` / `Xid` on another file
+        (Airtable-style relational refs commonly used in the demo data)
+    Plus, when sample/enumerated values are available on both sides, we compute
+    a Jaccard-style overlap ratio on the available values; if it's < 0.05 we
+    drop the pair (probably a name collision with no real relationship).
+
+    SQLite columns get the structural signal only (we don't read row data here
+    to keep inspect_data cheap).
+    """
+    cols = _collect_columns(inspect_out)
+    if len(cols) < 2:
+        return []
+
+    def base_name(n: str) -> str:
+        n = n.lower()
+        # link_to_X → X
+        if n.startswith("link_to_") and len(n) > len("link_to_"):
+            return n[len("link_to_"):]
+        for suf in ("_id", "id"):
+            if n.endswith(suf) and len(n) > len(suf):
+                return n[: -len(suf)]
+        return n
+
+    def is_link_to(n: str) -> bool:
+        return n.lower().startswith("link_to_")
+
+    candidates: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str, str, str]] = set()
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            if a["loc"] == b["loc"]:
+                continue  # only cross-file/cross-table joins matter here
+
+            a_name = a["name"].lower()
+            b_name = b["name"].lower()
+            if not a_name or not b_name:
+                continue
+
+            same_name = a_name == b_name
+            same_base = base_name(a_name) == base_name(b_name) and base_name(a_name) != ""
+            id_like = _is_id_like(a_name) and _is_id_like(b_name)
+            link_pair = (is_link_to(a_name) or is_link_to(b_name)) and same_base
+
+            # Accept as candidate if:
+            #  - names are exactly the same, OR
+            #  - both look id-like and share a base, OR
+            #  - one side is link_to_X and the other matches that X (or X_id)
+            if not (same_name or (same_base and id_like) or link_pair):
+                continue
+
+            # Sample-overlap check (only if both sides have values to compare)
+            overlap: float | None = None
+            a_set = set(str(v) for v in (a["values"] or a["samples"] or []))
+            b_set = set(str(v) for v in (b["values"] or b["samples"] or []))
+            if a_set and b_set:
+                inter = len(a_set & b_set)
+                union = len(a_set | b_set)
+                overlap = inter / union if union else 0.0
+                if overlap < 0.05:
+                    continue  # name match but no value overlap → unlikely real join
+
+            key = (a["loc"], a["name"], b["loc"], b["name"])
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            candidates.append({
+                "left": f"{a['loc']}:{a['name']}",
+                "right": f"{b['loc']}:{b['name']}",
+                "name_match": same_name,
+                "id_like": id_like,
+                "link_to": link_pair,
+                "value_overlap_jaccard": (None if overlap is None else round(overlap, 3)),
+            })
+
+    # Stable order: name-match first, then link_to, then alphabetic by left.
+    candidates.sort(key=lambda d: (not d["name_match"], not d.get("link_to"), d["left"]))
+    return candidates[:50]
 
 
 # ----- query helpers --------------------------------------------------

@@ -1,9 +1,9 @@
 # v5 Handoff Notes
 
-> 给打包/测试同学的简要说明。分支 `v5`（基于 origin/v3 + v4-dev 的全部改动）。
+> 给打包/测试同学的简要说明。分支 `v5`，HEAD = commit `fd7108f`（基于 origin/v3 + v4-dev 的全部改动 + R4）。
 >
 > **上次 v4 提交线上分 = 0.5319**（基于 commit `d2243ca`）。
-> v5 在 v4 基础上又叠了 2 个改动（C1 + Round1），本地 50-task 测均值 0.6567（+0.05 vs v4 的 0.6075）。
+> v5 在 v4 基础上又叠了 3 个改动（C1 + Round1 + R4），本地 50-task 测两跑均值 0.6583（+0.05 vs v4 的 0.6075）。
 
 ## 拉取 + 构建
 
@@ -39,6 +39,25 @@ docker save team1213:v3 | gzip > team1213_v3.tar.gz
 - schema 注入字符上限 `8000 → 16000`
 - knowledge.md 注入字符上限 `6000 → 12000`
 - `CLAUDE_EVAL_MAX_TURNS` 默认 `40 → 50`
+
+### 3. R4 — `inspect_data` 自动发现潜在 join 列（commit `fd7108f`）
+
+`inspect_data` 扫完 csv/json/sqlite 后，自动检测跨文件/表的 join 候选并附在 schema 摘要里。规则：
+- 列名完全相同（同名）
+- 列名都是 `_id` 后缀且共享 base
+- `link_to_X` 形式匹配 `X` / `X_id`（Airtable 风格）
+- 用 Jaccard overlap 验证值集合（< 0.05 的剔除）
+
+输出形如：
+```
+budget.csv:link_to_event <-> event.json:event_id  [link_to]  overlap=0.548
+trans.csv:account_id <-> disp.csv:account_id  [same-name,id-like]  overlap=1.0
+```
+
+agent 不需要再花 turn 自己摸 join 路径。本地 50-task：
+- 单跑测得 task_27 / task_199 / task_408（之前稳定 0/0.17）有时拿到 1.0
+- 但简单题偶尔被多余信息分心（task_22 / task_214）
+- 整体均值 R1 0.6567 → R4 0.6583，几乎相同但 task 分布变化明显
 
 ## 与 v3/v4 的差异（v3 → v4 → v5 累加）
 

@@ -42,7 +42,7 @@ MODEL_NAME = os.environ["MODEL_NAME"]
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "EMPTY")
 MAX_TASKS = int(os.environ.get("EVAL_MAX_TASKS", "0"))
 TASK_IDS_FILTER = [item.strip() for item in os.environ.get("EVAL_TASK_IDS", "").split(",") if item.strip()]
-MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "40"))
+MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "50"))
 MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "4")))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
@@ -750,11 +750,12 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
     )
 
 
-def _summarize_schema_for_prompt(schema: dict[str, Any], char_budget: int = 8000) -> str:
+def _summarize_schema_for_prompt(schema: dict[str, Any], char_budget: int = 16000) -> str:
     """Render `inspect_data` output as a compact prompt-ready chunk.
 
     We aggressively trim per-column samples and skip files that have errors.
-    The character budget bounds prompt growth on huge datasets.
+    The character budget bounds prompt growth on huge datasets. 16k chars (~4.5k tokens)
+    is comfortable on a 256k-context model and keeps complete schema for typical tasks.
     """
     lines: list[str] = []
     used = 0
@@ -814,7 +815,7 @@ def _summarize_schema_for_prompt(schema: dict[str, Any], char_budget: int = 8000
     return "".join(lines).rstrip()
 
 
-def _read_knowledge_md(task_dir: Path, char_budget: int = 6000) -> str | None:
+def _read_knowledge_md(task_dir: Path, char_budget: int = 12000) -> str | None:
     kp = task_dir / "context" / "knowledge.md"
     if not kp.exists():
         return None
@@ -873,8 +874,14 @@ async def run_task(task_id: str, attempt: int = 1, prior_failure_note: str | Non
         extra_args["debug-to-stderr"] = None
 
     answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path, task_dir=task_dir)
+    # Trim the Claude Code preset tool set down to what we actually need for offline data
+    # analysis. The full preset injects ~33 tools (~22.6K tokens) per request including ones
+    # that make no sense at evaluation time (AskUserQuestion, WebFetch, WebSearch, Cron*,
+    # Plan/Worktree mode, Skill, TodoWrite, Task subagent). Keeping only the file/text/exec
+    # primitives reduces request size by ~30% and narrows the model's choice space.
+    BUILTIN_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep"]
     options = ClaudeAgentOptions(
-        tools={"type": "preset", "preset": "claude_code"},
+        tools=BUILTIN_TOOLS,
         system_prompt={"type": "preset", "preset": "claude_code", "append": SYSTEM_PROMPT_APPEND},
         mcp_servers={"answer_server": answer_server},
         permission_mode=PERMISSION_MODE,

@@ -46,6 +46,11 @@ except Exception:  # pragma: no cover
     fitz = None  # type: ignore
 
 try:
+    import pdfplumber as _pdfplumber
+except Exception:  # pragma: no cover
+    _pdfplumber = None  # type: ignore
+
+try:
     import docx  # python-docx
 except Exception:  # pragma: no cover
     docx = None  # type: ignore
@@ -229,17 +234,31 @@ def _sqlite_summary(path: Path) -> dict[str, Any]:
 
 def _pdf_summary(path: Path) -> dict[str, Any]:
     info: dict[str, Any] = {"path": str(path), "kind": "pdf"}
-    if fitz is None:
-        info["is_error"] = True
-        info["message"] = "pymupdf not installed"
-        return info
     try:
         info["size_bytes"] = path.stat().st_size
-        with fitz.open(str(path)) as doc:
-            info["page_count"] = doc.page_count
-            if doc.page_count > 0:
-                first_text = doc[0].get_text()
-                info["page1_excerpt"] = _short_text(first_text, 600)
+        # Try pdfplumber first for table detection
+        if _pdfplumber is not None:
+            with _pdfplumber.open(str(path)) as doc:
+                info["page_count"] = len(doc.pages)
+                if doc.pages:
+                    p0 = doc.pages[0]
+                    text = p0.extract_text() or ""
+                    info["page1_excerpt"] = _short_text(text, 600)
+                    # Count tables across first 3 pages
+                    table_count = 0
+                    for pg in doc.pages[:3]:
+                        table_count += len(pg.extract_tables() or [])
+                    if table_count:
+                        info["table_count_first3pages"] = table_count
+        elif fitz is not None:
+            with fitz.open(str(path)) as doc:
+                info["page_count"] = doc.page_count
+                if doc.page_count > 0:
+                    first_text = doc[0].get_text()
+                    info["page1_excerpt"] = _short_text(first_text, 600)
+        else:
+            info["is_error"] = True
+            info["message"] = "neither pdfplumber nor pymupdf installed"
     except Exception as exc:
         info["is_error"] = True
         info["message"] = f"failed to summarize pdf: {exc!r}"
@@ -281,6 +300,7 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
         "sqlite": [],
         "pdf": [],
         "docx": [],
+        "video": [],
         "skipped": [],
     }
     if not context_dir.exists():
@@ -307,6 +327,10 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
             elif suffix == ".docx":
                 if len(out["docx"]) < max_files_per_kind:
                     out["docx"].append(_docx_summary(path))
+            elif suffix in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+                if len(out["video"]) < max_files_per_kind:
+                    out["video"].append({"path": str(path), "kind": "video",
+                                         "size_bytes": path.stat().st_size, "ext": suffix})
             else:
                 out["skipped"].append({"path": str(path), "ext": suffix})
         except Exception as exc:  # pragma: no cover
@@ -441,24 +465,49 @@ def _serialize_pandas_result(result: Any, max_rows: int) -> dict[str, Any]:
     return {"kind": type(result).__name__, "value": _short_text(repr(result), 800)}
 
 
-def read_pdf_pages(pdf_path: Path, page_start: int = 1, page_end: int = 1) -> dict[str, Any]:
-    if fitz is None:
-        return {"is_error": True, "message": "pymupdf not installed"}
+def read_pdf_pages(pdf_path: Path, page_start: int = 1, page_end: int = 1, extract_tables: bool = False) -> dict[str, Any]:
+    if _pdfplumber is None and fitz is None:
+        return {"is_error": True, "message": "neither pdfplumber nor pymupdf installed"}
     if not pdf_path.exists():
         return {"is_error": True, "message": f"pdf not found: {pdf_path}"}
     try:
-        with fitz.open(str(pdf_path)) as doc:
-            page_start = max(1, page_start)
-            page_end = min(doc.page_count, max(page_start, page_end))
-            chunks = []
-            for i in range(page_start - 1, page_end):
-                chunks.append({"page": i + 1, "text": doc[i].get_text()})
-            return {
-                "page_count": doc.page_count,
-                "pages": chunks,
-                "page_start": page_start,
-                "page_end": page_end,
-            }
+        # Use pdfplumber for better table extraction when available
+        if _pdfplumber is not None:
+            with _pdfplumber.open(str(pdf_path)) as doc:
+                page_count = len(doc.pages)
+                page_start = max(1, page_start)
+                page_end = min(page_count, max(page_start, page_end))
+                chunks = []
+                for i in range(page_start - 1, page_end):
+                    page = doc.pages[i]
+                    text = page.extract_text() or ""
+                    page_data: dict[str, Any] = {"page": i + 1, "text": text}
+                    # Extract tables if requested
+                    if extract_tables:
+                        tables = page.extract_tables()
+                        if tables:
+                            page_data["tables"] = tables
+                    chunks.append(page_data)
+                return {
+                    "page_count": page_count,
+                    "pages": chunks,
+                    "page_start": page_start,
+                    "page_end": page_end,
+                }
+        else:
+            # Fallback to pymupdf (text only)
+            with fitz.open(str(pdf_path)) as doc:
+                page_start = max(1, page_start)
+                page_end = min(doc.page_count, max(page_start, page_end))
+                chunks = []
+                for i in range(page_start - 1, page_end):
+                    chunks.append({"page": i + 1, "text": doc[i].get_text()})
+                return {
+                    "page_count": doc.page_count,
+                    "pages": chunks,
+                    "page_start": page_start,
+                    "page_end": page_end,
+                }
     except Exception as exc:
         return {"is_error": True, "message": f"pdf read failed: {exc!r}"}
 

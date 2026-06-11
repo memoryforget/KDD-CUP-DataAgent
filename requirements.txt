@@ -6,3 +6,4 @@ sentence-transformers
 pandas
 pymupdf
 python-docx
+opencv-python-headless

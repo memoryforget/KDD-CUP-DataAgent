@@ -22,6 +22,7 @@ from app.structured_tools import (
     read_pdf_pages,
     sqlite_query,
 )
+from app.video_tools import analyze_video_frames
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -42,7 +43,7 @@ MODEL_NAME = os.environ["MODEL_NAME"]
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "EMPTY")
 MAX_TASKS = int(os.environ.get("EVAL_MAX_TASKS", "0"))
 TASK_IDS_FILTER = [item.strip() for item in os.environ.get("EVAL_TASK_IDS", "").split(",") if item.strip()]
-MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "50"))
+MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "60"))
 MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "4")))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
@@ -70,6 +71,8 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- Never write to the input directory.",
     "- Do not spend turns diagnosing paths, environment variables, symlinks, or network connectivity.",
     "- If context/knowledge.md exists for the current task, read it first — it defines domain-specific terms, code mappings, and categorical meanings that override general knowledge.",
+    "- Do not ask the user clarifying questions, offer to continue, or end with a narrative status update. This is a benchmark task, not an interactive chat.",
+    "- A task is only complete after you call `answer` successfully. Explanatory text alone is not a valid completion state.",
     "",
     "## Data analysis strategy",
     "- Start by reading task.json to understand the question.",
@@ -95,6 +98,7 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "## Answer submission rules",
     "- Submit the final result exclusively through the MCP tool named `answer`. Do not write prediction.csv directly with Write, Edit, or Bash.",
     "- Before calling `answer`, ALWAYS call `preview_answer` first to see the column-level signature summary, and use it to decide whether to drop columns.",
+    "- If you already have candidate rows, stop exploring and move directly to `preview_answer` then `answer`. Do not keep debugging once a plausible answer table exists.",
     "- Call `answer` exactly once with a JSON object containing `columns` and `rows`.",
     "  - Prefer native arrays, not quoted JSON strings; quoted JSON strings are accepted only as a fallback.",
     "  - Every row must have exactly the same number of cells as columns.",
@@ -125,6 +129,7 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- For SQLite, prefer one well-formed SELECT over many trial queries.",
     "- After computing your candidate result, call `preview_answer` to see column signatures and trim redundant columns.",
     "- Then call `answer` exactly once. After a successful answer, briefly summarize and stop.",
+    "- Never end by saying the data may be missing, asking whether to keep checking, or offering alternatives. Either submit the best evidence-based answer from the task files or fail trying.",
 ])
 
 
@@ -526,6 +531,37 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
         return {"content": [{"type": "text", "text": rendered}], "is_error": bool(result.get("is_error"))}
 
     @tool(
+        name="analyze_video",
+        description=(
+            "Analyze a task-local video file using the model's native video understanding capability. "
+            "Pass `video_path` relative to the task root, for example `context/video/briefing.mp4`. "
+            "Do NOT pass an absolute path, do NOT pass a workspace path, and do NOT strip the leading `context/`. "
+            "Pass the task question in `question`. "
+            "Useful for extracting information from video briefings, presentations, or recordings."
+        ),
+        input_schema={
+            "video_path": str,
+            "question": str,
+        },
+    )
+    async def analyze_video_tool(args: dict[str, Any]) -> dict[str, Any]:
+        rel_path = str(args.get("video_path", "")).strip().lstrip("/")
+        question = str(args.get("question", "")).strip()
+        if not question:
+            return {"content": [{"type": "text", "text": "question parameter is required"}], "is_error": True}
+        candidate = (task_dir / rel_path).resolve()
+        try:
+            candidate.relative_to(task_dir.resolve())
+        except ValueError:
+            return {"content": [{"type": "text", "text": "video_path must be inside the task directory."}], "is_error": True}
+        if not candidate.exists():
+            return {"content": [{"type": "text", "text": f"video not found: {rel_path}"}], "is_error": True}
+        result = analyze_video_frames(candidate, question)
+        rendered = json.dumps(result, ensure_ascii=False, default=str)
+        log_verbose(task_log, f"[{task_id}][analyze_video] {rel_path} question={question[:100]}")
+        return {"content": [{"type": "text", "text": rendered}], "is_error": bool(result.get("is_error"))}
+
+    @tool(
         name="preview_answer",
         description=(
             "Preview the column-level signature summary of a candidate answer table BEFORE submitting it. "
@@ -744,6 +780,7 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
             pandas_query_tool,
             read_pdf_pages_tool,
             read_docx_full_tool,
+            analyze_video_tool,
             preview_answer,
             submit_answer,
         ],

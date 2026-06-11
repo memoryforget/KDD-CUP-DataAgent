@@ -4,13 +4,8 @@ Uses the SAME model (qwen3.5-35b-a3b served via vLLM) with native video_url
 input support to analyze video content. The model handles frame sampling
 internally when given a video_url.
 
-For the evaluation environment (vLLM local serving):
-- Video is passed via file:// URI or base64 data URI
-- The model internally samples frames (default fps=2)
-
-For local testing through an API gateway:
-- Video is encoded as base64 data URI
-- fps can be configured via mm_processor_kwargs
+Following the official Phase 2 starter kit, video is always sent as a base64
+data URI. This avoids relying on model-server access to local file paths.
 """
 from __future__ import annotations
 
@@ -89,16 +84,9 @@ def get_video_metadata(video_path: Path) -> dict[str, Any]:
 def _build_video_url(video_path: Path) -> str:
     """Build the video URL for the API call.
 
-    In vLLM local deployment: use file:// URI for efficiency.
-    In remote API testing: use base64 data URI.
+    Always encode the task-local video as a base64 data URI.
+    The official Phase 2 starter kit uses this format for video_url input.
     """
-    api_url = _get_model_api_url().rstrip("/")
-
-    # If the model API is localhost/127.0.0.1, assume local vLLM and use file:// URI
-    if any(host in api_url for host in ("localhost", "127.0.0.1", "0.0.0.0")):
-        return f"file://{video_path.resolve()}"
-
-    # Otherwise, encode as base64 data URI for remote API
     with open(video_path, "rb") as f:
         video_b64 = base64.b64encode(f.read()).decode("ascii")
     return f"data:video/mp4;base64,{video_b64}"

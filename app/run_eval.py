@@ -43,8 +43,8 @@ MODEL_NAME = os.environ["MODEL_NAME"]
 MODEL_API_KEY = os.environ.get("MODEL_API_KEY", "EMPTY")
 MAX_TASKS = int(os.environ.get("EVAL_MAX_TASKS", "0"))
 TASK_IDS_FILTER = [item.strip() for item in os.environ.get("EVAL_TASK_IDS", "").split(",") if item.strip()]
-MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "60"))
-MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "4")))
+MAX_TURNS = int(os.environ.get("CLAUDE_EVAL_MAX_TURNS", "50"))
+MAX_WORKERS = max(1, int(os.environ.get("EVAL_MAX_WORKERS", "6")))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 CLAUDE_CLI_PATH = os.environ.get("CLAUDE_CLI_PATH", "claude")
 DEBUG_TO_STDERR = os.environ.get("CLAUDE_DEBUG_TO_STDERR", "0") == "1"
@@ -57,7 +57,7 @@ TASK_LOG_DIR = LOG_ROOT / "tasks"
 NULL_TOKENS = {"", "null", "none", "nan", "nat", "<na>"}
 
 # Per-task wall-clock budget (seconds). 0 means no timeout.
-TASK_TIMEOUT_SEC = int(os.environ.get("EVAL_TASK_TIMEOUT_SEC", "600"))
+TASK_TIMEOUT_SEC = int(os.environ.get("EVAL_TASK_TIMEOUT_SEC", "1000"))
 # How many extra retry attempts after the first run if the task fails.
 TASK_MAX_RETRIES = int(os.environ.get("EVAL_TASK_MAX_RETRIES", "1"))
 # When True, write a placeholder prediction.csv if everything fails so the task is not 0-file.
@@ -70,20 +70,24 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- Only access files belonging to the current task. Never read other tasks or any gold.csv.",
     "- Never write to the input directory.",
     "- Do not spend turns diagnosing paths, environment variables, symlinks, or network connectivity.",
-    "- If context/knowledge.md exists for the current task, read it first — it defines domain-specific terms, code mappings, and categorical meanings that override general knowledge.",
+    "- If context/knowledge.md exists for the current task, read it early — it defines domain-specific terms, code mappings, and categorical meanings that override general knowledge.",
     "- Do not ask the user clarifying questions, offer to continue, or end with a narrative status update. This is a benchmark task, not an interactive chat.",
-    "- A task is only complete after you call `answer` successfully. Explanatory text alone is not a valid completion state.",
+    "- A task is only complete after you call `mcp__answer_server__answer` successfully. Explanatory text alone is not a valid completion state.",
     "",
     "## Data analysis strategy",
     "- Start by reading task.json to understand the question.",
-    "- Call `inspect_data` BEFORE writing any csv/json parser. It returns column names, dtypes, sample values, and full enumerations of low-cardinality categorical columns. This is the cheapest way to understand the data and decide what categorical codes mean.",
-    "- For SQLite databases: prefer `sqlite_query` (read-only SELECT) over writing your own sqlite3 Python scripts.",
-    "- For CSVs: prefer `pandas_query` over writing your own csv parser. The `df` variable is the loaded DataFrame; you can pass extra_csvs to load joined tables in one call.",
-    "- For PDFs use `read_pdf_pages`; for DOCX use `read_docx_full`.",
-    "- For unstructured data, especially Markdown/text files, use the MCP tools `list_markdown_docs`, `search_markdown`, and `read_markdown_chunk` before any broad Read/Grep/Bash parsing.",
-    "- If a Markdown/text file is longer than about 200 lines, do not read or parse the whole file first. Search it with `search_markdown`, then read only relevant chunks with `read_markdown_chunk`.",
-    "- For questions over long narrative Markdown datasets, run multiple focused `search_markdown` queries for the requested fields/entities before writing Python parsers.",
-    "- Do not guess the meaning of categorical codes or integer labels from their numeric order. Rely on documentation (knowledge.md) or `inspect_data`'s enumerated values.",
+    "- After reading task.json and knowledge.md (if present), call `mcp__answer_server__inspect_data` before writing any csv/json parser or guessing categorical codes.",
+    "- `mcp__answer_server__inspect_data` returns column names, dtypes, sample values, and full enumerations of low-cardinality categorical columns. Use it to understand structured files before writing any csv/json parser.",
+    "- For SQLite databases: prefer `mcp__answer_server__sqlite_query` (read-only SELECT / WITH / introspection PRAGMA) over writing your own sqlite3 Python scripts.",
+    "- For CSV files only: prefer `mcp__answer_server__pandas_query` over writing your own csv parser. The `df` variable is the loaded DataFrame; you can pass extra_csvs to load joined tables in one call.",
+    "- `mcp__answer_server__pandas_query` is for CSV files, not JSON files.",
+    "- For PDFs use `mcp__answer_server__read_pdf_pages`; for DOCX use `mcp__answer_server__read_docx_full`.",
+    "- For unstructured data, especially Markdown/text files, use the MCP tools `mcp__answer_server__list_markdown_docs`, `mcp__answer_server__search_markdown`, and `mcp__answer_server__read_markdown_chunk` before any broad Read/Grep/Bash parsing.",
+    "- If a Markdown/text file is longer than about 200 lines, do not read or parse the whole file first. Search it with `mcp__answer_server__search_markdown`, then read only relevant chunks with `mcp__answer_server__read_markdown_chunk`.",
+    "- For questions over long narrative Markdown datasets, run multiple focused `mcp__answer_server__search_markdown` queries for the requested fields/entities before writing Python parsers.",
+    "- For video tasks: treat the video primarily as a source of filtering criteria, thresholds, years, names, or configuration values. Use `mcp__answer_server__analyze_video`.",
+    "- Do not treat video output as the final table answer when the task also requires aggregation, joins, ranking, or counting. Extract the criteria from video first, then verify the final answer against structured files.",
+    "- Do not guess the meaning of categorical codes or integer labels from their numeric order. Rely on documentation (knowledge.md) or `mcp__answer_server__inspect_data`'s enumerated values.",
     "- Falling back to Bash + Python is allowed but should be a last resort, not the first tool you reach for.",
     "",
     "## How the grader scores you (read carefully)",
@@ -96,10 +100,11 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- The naming of columns and the row order are FREE — focus on (a) which columns to include and (b) per-cell value accuracy.",
     "",
     "## Answer submission rules",
-    "- Submit the final result exclusively through the MCP tool named `answer`. Do not write prediction.csv directly with Write, Edit, or Bash.",
-    "- Before calling `answer`, ALWAYS call `preview_answer` first to see the column-level signature summary, and use it to decide whether to drop columns.",
-    "- If you already have candidate rows, stop exploring and move directly to `preview_answer` then `answer`. Do not keep debugging once a plausible answer table exists.",
-    "- Call `answer` exactly once with a JSON object containing `columns` and `rows`.",
+    "- Submit the final result exclusively through `mcp__answer_server__answer`. Do not write prediction.csv directly with Write, Edit, or Bash.",
+    "- Before calling `mcp__answer_server__answer`, call `mcp__answer_server__preview_answer` to inspect the column-level signature summary and catch malformed rows/columns.",
+    "- Use `mcp__answer_server__preview_answer` as a structural sanity check before submission.",
+    "- If you already have candidate rows, stop exploring and move directly to `mcp__answer_server__preview_answer` then `mcp__answer_server__answer`. Do not keep debugging once a plausible answer table exists.",
+    "- Call `mcp__answer_server__answer` exactly once with a JSON object containing `columns` and `rows`.",
     "  - Prefer native arrays, not quoted JSON strings; quoted JSON strings are accepted only as a fallback.",
     "  - Every row must have exactly the same number of cells as columns.",
     "",
@@ -124,11 +129,17 @@ SYSTEM_PROMPT_APPEND = "\n".join([
     "- 'lowest/highest/maximum/minimum X' may have ties. After computing the extremum, check whether multiple rows share that extremum value and include ALL tied rows.",
     "- 'all …' / 'list all …' means return every matching row, not a single example.",
     "",
+    "## Path rules",
+    "- For every MCP tool path argument (`db_path`, `csv_path`, `pdf_path`, `docx_path`, `video_path`, `path`), pass a TASK-LOCAL RELATIVE path such as `context/db/sub_db.sqlite` or `context/csv/foo.csv`.",
+    "- MCP tools expect task-local relative paths.",
+    "- Always use the MCP full tool names shown in the tool list, such as `mcp__answer_server__sqlite_query` and `mcp__answer_server__preview_answer`.",
+    "- If a bare tool name like `sqlite_query`, `pandas_query`, `preview_answer`, or `answer` fails, immediately retry with the MCP full name `mcp__answer_server__...`.",
+    "",
     "## Workflow",
-    "- Read task.json → list context/ → read knowledge.md if present.",
-    "- For SQLite, prefer one well-formed SELECT over many trial queries.",
-    "- After computing your candidate result, call `preview_answer` to see column signatures and trim redundant columns.",
-    "- Then call `answer` exactly once. After a successful answer, briefly summarize and stop.",
+    "- Read task.json → read knowledge.md if present → call `mcp__answer_server__inspect_data`.",
+    "- For SQLite, prefer one well-formed query over many trial queries; use read-only `PRAGMA` first when you need schema details such as columns or indexes.",
+    "- After computing your candidate result, call `mcp__answer_server__preview_answer` to inspect column signatures and trim redundant columns.",
+    "- Then call `mcp__answer_server__answer` exactly once. After a successful answer, briefly summarize and stop.",
     "- Never end by saying the data may be missing, asking whether to keep checking, or offering alternatives. Either submit the best evidence-based answer from the task files or fail trying.",
 ])
 
@@ -392,8 +403,10 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
     @tool(
         name="sqlite_query",
         description=(
-            "Run a read-only SELECT (or WITH) against a task-local SQLite database file. "
-            "Reject any non-SELECT/WITH statement. Pass `db_path` (path under context/) and `sql`. "
+            "Run a read-only SELECT, WITH, or schema-inspection PRAGMA against a task-local SQLite database file. "
+            "Reject any write statement; only a small allowlist of read-only PRAGMAs is supported."
+            "(for example `PRAGMA table_info('table_name')` or `PRAGMA index_list('table_name')`). "
+            "Pass `db_path` (path under context/) and `sql`. "
             "Up to 200 rows are returned; the response includes `truncated` if more are available. "
             "Use this instead of writing your own sqlite3 Python scripts when a SQLite file is present."
         ),
@@ -565,8 +578,8 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
         name="preview_answer",
         description=(
             "Preview the column-level signature summary of a candidate answer table BEFORE submitting it. "
-            "Returns per-column unique-value count, sample values, dtype guess, and a redundancy hint based on the question. "
-            "Use this every time before calling `answer` to decide whether to drop columns. "
+            "Returns per-column unique-value count, sample values, dtype guess, and structural warnings for empty or suspicious columns. "
+            "Use this every time before calling `answer` as a structural sanity check. "
             "Input shape is the same as `answer`: an object with columns and rows."
         ),
         input_schema={
@@ -644,13 +657,8 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
             if s["all_same_value"] and s["row_count"] > 1:
                 warnings.append(
                     f"column '{s['column_name']}' has only one distinct value ({s['sample_values']}); "
-                    f"this column rarely matches a gold column unless the question demanded it."
+                    f"it may be intentional, but it is worth double-checking."
                 )
-        if len(columns) > 1:
-            warnings.append(
-                "You have more than 1 column. The grader penalizes extra columns. "
-                "Re-read the question: if it asks for a single field, drop everything except that field."
-            )
 
         result = {
             "column_count": len(columns),
@@ -659,8 +667,7 @@ def build_answer_mcp_server(task_id: str, output_csv: Path, task_log_path: Path,
             "warnings": warnings,
             "reminder": (
                 "Grader ignores column NAMES and row order. It sorts each column's values and matches "
-                "by value-set equality. Per-task score = recall × redundancy. Adding an extra column "
-                "ALWAYS reduces the score unless it happens to match a gold column."
+                "by value-set equality."
             ),
         }
         rendered = json.dumps(result, ensure_ascii=False)
@@ -883,11 +890,11 @@ def build_task_prompt(task_id: str, question: str) -> str:
         "**Steps:**",
         f"1. The schema summary of context/ is provided below — use it to pick the right files. Skip blind file listing.",
         "2. Read knowledge.md (provided below if present); it overrides general knowledge.",
-        "3. Choose the right query tool: `sqlite_query` for .sqlite/.db, `pandas_query` for CSV joins/aggregations, `search_markdown`+`read_markdown_chunk` for long markdown.",
+        "3. Choose the right query tool: `mcp__answer_server__sqlite_query` for .sqlite/.db files, `mcp__answer_server__pandas_query` for CSV joins/aggregations, and `mcp__answer_server__search_markdown` + `mcp__answer_server__read_markdown_chunk` for long markdown/text.",
         "4. Compute the candidate answer. Preserve full numeric precision (no rounding).",
         "5. Re-read the question and decide the MINIMUM column set. Default to one column unless the question literally asks for multiple fields.",
-        "6. Call `preview_answer` with your candidate columns/rows. Drop any column not directly demanded by the question.",
-        "7. Call `answer` exactly once with the trimmed result.",
+        "6. Call `mcp__answer_server__preview_answer` with your candidate columns/rows. Drop any column not directly demanded by the question.",
+        "7. Call `mcp__answer_server__answer` exactly once with the trimmed result.",
     ])
 
 
@@ -910,7 +917,12 @@ async def run_task(task_id: str, attempt: int = 1, prior_failure_note: str | Non
     if DEBUG_TO_STDERR:
         extra_args["debug-to-stderr"] = None
 
-    answer_server = build_answer_mcp_server(task_id=task_id, output_csv=output_csv, task_log_path=task_log_path, task_dir=task_dir)
+    answer_server = build_answer_mcp_server(
+        task_id=task_id,
+        output_csv=output_csv,
+        task_log_path=task_log_path,
+        task_dir=task_dir,
+    )
     # Trim the Claude Code preset tool set down to what we actually need for offline data
     # analysis. The full preset injects ~33 tools (~22.6K tokens) per request including ones
     # that make no sense at evaluation time (AskUserQuestion, WebFetch, WebSearch, Cron*,

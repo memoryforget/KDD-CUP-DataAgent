@@ -24,6 +24,10 @@ RUN ARCH="$(dpkg --print-architecture)"     \
 WORKDIR /opt/kddcup-submission
 
 COPY requirements.txt ./requirements.txt
+RUN pip install torch \
+      -i https://pypi.tuna.tsinghua.edu.cn/simple \
+      --extra-index-url https://download.pytorch.org/whl/cpu \
+      --default-timeout=1000
 RUN pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn --default-timeout=1000
 
 COPY models/all-MiniLM-L6-v2 /opt/models/all-MiniLM-L6-v2

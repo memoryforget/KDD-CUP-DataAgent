@@ -94,7 +94,7 @@ Before the final image is submitted, still verify these points on a machine with
 After `docker load -i team1213_v1.tar.gz`, the evaluation system should be able to start the image directly with a command in the official shape:
 
 ```bash
-docker run --rm   --network=eval_net   --cpus=16   --memory=64g   --memory-swap=64g   -v /eval/data/input:/input:ro   -v /eval/<submission_id>/output:/output:rw   -v /eval/<submission_id>/logs:/logs:rw   -e MODEL_API_URL=<model_url>   -e MODEL_API_KEY=<api_key>   -e MODEL_NAME=qwen3.5-35b-a3b   team1213:v1
+docker run --rm  -it --add-host=host.docker.internal:host-gateway -v /vepfs-mlp2/c20250602/500050/lh/xqf/kddcup2026-data-agents-starter-kit/demo_samples_phase2/input:/input:ro   -v /vepfs-mlp2/c20250602/500050/lh/xqf/tmp_kdd_testvideo/kddcup_eval_output:/output:rw   -v /vepfs-mlp2/c20250602/500050/lh/xqf/tmp_kdd_testvideo/kddcup_eval_logs:/logs:rw   -e MODEL_API_URL=http://host.docker.internal:8005/v1   -e MODEL_API_KEY=1   -e MODEL_NAME=qwen3.5-35b-a3b   team1213:v1
 ```
 
 No extra startup arguments are required because the image already sets `ENTRYPOINT`.

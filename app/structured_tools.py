@@ -341,17 +341,44 @@ def inspect_data(task_dir: Path, max_files_per_kind: int = 50) -> dict[str, Any]
 # ----- query helpers --------------------------------------------------
 
 
+_READ_ONLY_PRAGMAS = {
+    "table_info",
+    "table_xinfo",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "database_list",
+    "collation_list",
+    "compile_options",
+    "function_list",
+    "module_list",
+    "pragma_list",
+}
+
+
 def sqlite_query(db_path: Path, sql: str, max_rows: int = DEFAULT_MAX_ROWS) -> dict[str, Any]:
     sql_stripped = sql.strip().rstrip(";")
     if not sql_stripped:
         return {"is_error": True, "message": "sql is empty"}
     lowered = sql_stripped.lower()
-    if not (lowered.startswith("select") or lowered.startswith("with")):
-        return {"is_error": True, "message": "only SELECT / WITH queries are allowed"}
-    forbidden = ("attach ", "detach ", "pragma ", "insert ", "update ", "delete ",
+    is_readonly_pragma = False
+    if lowered.startswith("pragma"):
+        match = re.match(r"^pragma\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql_stripped, flags=re.IGNORECASE)
+        pragma_name = match.group(1).lower() if match else ""
+        if pragma_name not in _READ_ONLY_PRAGMAS:
+            return {"is_error": True, "message": "only read-only schema PRAGMAs are allowed"}
+        if "=" in sql_stripped:
+            return {"is_error": True, "message": "PRAGMA assignments are not allowed"}
+        is_readonly_pragma = True
+    elif not (lowered.startswith("select") or lowered.startswith("with")):
+        return {"is_error": True, "message": "only SELECT / WITH / read-only PRAGMA queries are allowed"}
+    forbidden = ("attach ", "detach ", "insert ", "update ", "delete ",
                  "drop ", "create ", "alter ", "replace ", "vacuum")
     if any(token in lowered for token in forbidden):
         return {"is_error": True, "message": "query contains a non-read keyword"}
+    if not is_readonly_pragma and "pragma " in lowered:
+        return {"is_error": True, "message": "PRAGMA is only allowed as the top-level statement"}
     try:
         uri = f"file:{db_path.as_posix()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
